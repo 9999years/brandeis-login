@@ -56,8 +56,14 @@ class Brandeis:
         if not username:
             raise ValueError('Empty username not allowed')
 
+        # This whole process is obtuse and obscure, but follows the SAML / SSO
+        # / IdP process pretty well, actually. For details on what we're doing,
+        # check Wikipedia:
+        # https://en.wikipedia.org/wiki/Security_Assertion_Markup_Language#Use
+        # That's the process we're reverse-engineering.
+
         logging.info('Requesting login URL')
-        # this request populates a session cookie
+        # this request populates any session cookies / etc.
         req = self.get(LOGIN_REDIR_URL)
         if not req.ok:
             raise ConnectionError
@@ -65,6 +71,7 @@ class Brandeis:
         if self.session.cookies:
             logging.info('Cookies: ' + str(self.session.cookies))
 
+        # next, we try to access LATTE, which redirects to the real login page
         logging.info('Attempting to access LATTE to get login page')
         req = self.get(LATTE_URL)
         if not req.url.startswith(LOGIN_PREFIX):
@@ -72,32 +79,44 @@ class Brandeis:
         logging.info('Login page: ' + req.url)
         log_history(req)
 
+        # parse the page to fill out our form correctly
         # figure out where to POST to
         soup = make_soup(req)
         form = soup.find('form', {'name': 'f'})
         login_post = urljoin(req.url, form['action'])
 
-        # fill out any hidden elements, although there don't seem to be any
+        # fill out any hidden elements, although there don't seem to be any.
+        # this will make the process resilient if they add CSRF in the future
         data = form_defaults(form)
+        # if you don't have an _eventId_proceed, you don't get anything, it
+        # just redirects you to the same page again with no visible error
+        # message
         data.setdefault('_eventId_proceed', '')
         logging.info('Form data (except for username and password): ' + repr(data))
+        # fill out the sensitive stuff
         data['j_username'] = username
         data['j_password'] = password
 
+        # the actual username / password authentication, but it's not the last step
         logging.info('POSTing login to ' + login_post)
         req = self.post(login_post, data=data)
         if not req.ok:
             raise ConnectionError('Login request failed')
         log_history(req)
 
+        # check for errors ("username not found", "incorrect password", etc.)
+        # on the page
         soup = make_soup(req)
         err = soup.find('div', {'class': 'aui-message-error'}) or soup.find('p', {'class': 'form-error'})
         if err:
             raise ConnectionError(err.text)
 
+        # make sure the login went okay and we got session cookies as expected
         if not self.session.cookies['shib_idp_session_ss'] or not self.session.cookies['shib_idp_session']:
             raise ConnectionError('No Shibboleth session cookies set')
 
+        # finally (and critically) we need to submit the SAMLResponse tokens to
+        # finish authenticating
         form = soup.find('form')
         logging.info('Making redirect request')
         req = self.post(form['action'], data=form_defaults(form))
@@ -105,9 +124,11 @@ class Brandeis:
             raise ConnectionError('Redirect request failed')
         log_history(req)
 
+        # make sure we actually got the LATTE page correctly
         if not req.url.startswith(LATTE_URL):
             raise ConnectionError("Login didn't redirect where expected")
 
+        # now we're done
         self.logged_in = True
 
     def logout(self):
